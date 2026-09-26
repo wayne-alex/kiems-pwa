@@ -1,0 +1,80 @@
+/* src/app.css */
+:root {
+  /* Neutral foundation — the expensive-looking part */
+  --paper: #F7F7F5;
+  --paper-2: #F0F0EC;
+  --surface: #FFFFFF;
+  --ink: #0A0A0A;
+  --ink-2: #58585A;
+  --ink-3: #8A8A8C;
+  --ink-4: #B4B4B6;
+  --hairline: rgba(10,10,10,.06);
+  --hairline-2: rgba(10,10,10,.10);
+
+  /* Single accent — used sparingly */
+  --accent: #4C7128;
+  --accent-soft: #E8F0DC;
+  --accent-glow: rgba(76,113,40,.20);
+
+  /* Secondary accent for Movement */
+  --blue: #1E5FA8;
+  --blue-soft: #E5EEF9;
+
+  /* Semantic */
+  --danger: #C0392B;
+  --warn: #9A6B00;
+
+  /* Radii — deliberate, not uniform */
+  --r-sm: 8px;
+  --r: 12px;
+  --r-lg: 16px;
+  --r-xl: 24px;
+
+  /* Shadows — few, soft, only where needed */
+  --shadow-1: 0 1px 2px rgba(10,10,10,.04);
+  --shadow-2: 0 4px 16px rgba(10,10,10,.06);
+  --shadow-3: 0 12px 40px rgba(10,10,10,.08);
+
+  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+  --font-display: 'Inter', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+
+  --ease: cubic-bezier(.32,.72,0,1);
+}
+
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+
+html, body { margin: 0; padding: 0; min-height: 100%; }
+
+body {
+  font-family: var(--font-sans);
+  background: var(--paper);
+  color: var(--ink);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  font-size: 14px;
+  line-height: 1.4;
+  letter-spacing: -0.01em;   /* tighter tracking — this is what makes type feel modern */
+  overscroll-behavior-y: none;
+}
+
+h1, h2, h3 { margin: 0; letter-spacing: -0.025em; font-weight: 600; }
+
+button { font-family: inherit; letter-spacing: inherit; }
+
+/* entrance */
+@keyframes rise {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes fadein {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: .01ms !important;
+    transition-duration: .01ms !important;
+  }
+}
