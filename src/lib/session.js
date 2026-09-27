@@ -1,4 +1,4 @@
-// src/lib/session.js
+import { apiUrl } from './config.js';
 import { writable, derived, get } from 'svelte/store';
 import { getDeviceFingerprint } from './device.js';
 import { apiFetch } from './api.js';
@@ -45,14 +45,14 @@ export async function resolveSession() {
   try {
     const fingerprint = await getDeviceFingerprint();
 
-    // 1. Ensure device record exists (creates if needed)
-    const reg = await fetch('/kiems/register-device/', {
+      // 1. Ensure device record exists (creates if needed)
+    const reg = await fetch(apiUrl('/kiems/register-device/'), {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'X-CSRFToken': cookie('csrftoken') || '',
       },
-      credentials: 'same-origin',
+      credentials: 'include',
       body: JSON.stringify({
         fingerprint,
         device_info: {

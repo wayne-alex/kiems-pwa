@@ -23,9 +23,18 @@ export default defineConfig({
         scope: '/',
         start_url: '/',
         icons: [
-          { src: '/icons/icon-192.png', sizes: '192x192', type: 'image/png', purpose: 'any' },
-          { src: '/icons/icon-512.png', sizes: '512x512', type: 'image/png', purpose: 'any' },
-          { src: '/icons/icon-maskable-512.png', sizes: '512x512', type: 'image/png', purpose: 'maskable' },
+          {
+            src: '/icons/icon-192.png',
+            sizes: '192x192',
+            type: 'image/png',
+            purpose: 'any',
+          },
+          {
+            src: '/icons/icon-512.png',
+            sizes: '512x512',
+            type: 'image/png',
+            purpose: 'any',
+          },
         ],
       },
     }),
@@ -34,11 +43,11 @@ export default defineConfig({
     port: 5173,
     host: '0.0.0.0',
     proxy: {
-      '/kiems':    { target: 'http://127.0.0.1:8000', changeOrigin: true },
-      '/api':      { target: 'http://127.0.0.1:8000', changeOrigin: true },
+      '/kiems': { target: 'http://127.0.0.1:8000', changeOrigin: true },
+      '/api': { target: 'http://127.0.0.1:8000', changeOrigin: true },
       '/movement': { target: 'http://127.0.0.1:8000', changeOrigin: true },
-      '/static':   { target: 'http://127.0.0.1:8000', changeOrigin: true },
-      '/media':    { target: 'http://127.0.0.1:8000', changeOrigin: true },
+      '/static': { target: 'http://127.0.0.1:8000', changeOrigin: true },
+      '/media': { target: 'http://127.0.0.1:8000', changeOrigin: true },
     },
   },
 });

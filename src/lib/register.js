@@ -1,16 +1,17 @@
 // src/lib/register.js
 import { getDeviceFingerprint } from './device.js';
+import { apiUrl } from './config.js';
 
 export async function registerDevice() {
   try {
     const fingerprint = await getDeviceFingerprint();
-    const res = await fetch('/kiems/register-device/', {
+    const res = await fetch(apiUrl('/kiems/register-device/'), {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'X-CSRFToken': getCookie('csrftoken') || '',
       },
-      credentials: 'same-origin',
+      credentials: 'include',
       body: JSON.stringify({
         fingerprint,
         device_info: {
