@@ -14,10 +14,10 @@ export default defineConfig({
       },
       manifest: {
         name: 'IEBC Field',
-        short_name: 'IEBC',
+        short_name: 'IEBC Field',
         description: 'KIEMS field reporting',
-        theme_color: '#F7F7F5',
-        background_color: '#F7F7F5',
+        theme_color: '#FFFFFF',
+        background_color: '#FFFFFF',
         display: 'standalone',
         orientation: 'portrait',
         scope: '/',

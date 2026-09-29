@@ -1,5 +1,5 @@
 <script>
-  import { onMount } from 'svelte';
+  import { createEventDispatcher, onMount } from 'svelte';
   import { fade } from 'svelte/transition';
 
   import HomePage from './routes/HomePage.svelte';
@@ -7,29 +7,48 @@
   import MovementPage from './routes/MovementPage.svelte';
   import BindModal from './components/BindModal.svelte';
 
-  import { session, resolveSession } from './lib/session.js';
+  import { session, restoreSession, resolveSession } from './lib/session.js';
   import { initOffline } from './lib/offline.js';
+  import { apiFetch } from './lib/api.js';
+  import { captureCardRect, clearSourceCard } from './lib/transition.js';
 
   let route = 'home';
   const goHome = () => (route = 'home');
 
   $: unbound = $session.status === 'unbound';
 
+  // Called by a service page's back button. We capture the source card's
+  // rect on Home *before* switching routes so the reverse animation works.
+  function backToHome(fromRoute) {
+    const cardId = fromRoute === 'entry' ? 'entry' : 'movement';
+    const card = document.querySelector(`[data-card="${cardId}"]`);
+    if (card) {
+      captureCardRect(card, cardId === 'entry' ? 'green' : 'blue');
+    }
+    route = 'home';
+  }
+
   onMount(async () => {
     initOffline();
-    await resolveSession();
+    const restored = restoreSession();
+    (async () => {
+      apiFetch('/api/csrf/').catch((err) => {
+        console.warn('[boot] CSRF seed failed:', err);
+      });
+      await resolveSession({ silent: restored });
+    })();
   });
 </script>
 
 <div class="app-shell">
   {#key route}
-    <div in:fade={{ duration: 180 }}>
+    <div in:fade={{ duration: 160 }}>
       {#if route === 'home'}
         <HomePage on:navigate={(e) => (route = e.detail)} />
       {:else if route === 'entry'}
-        <EntryPage on:back={goHome} />
+        <EntryPage on:back={() => backToHome('entry')} />
       {:else}
-        <MovementPage on:back={goHome} />
+        <MovementPage on:back={() => backToHome('movement')} />
       {/if}
     </div>
   {/key}
@@ -38,9 +57,7 @@
     <BindModal on:bound={() => resolveSession()} />
   {/if}
 </div>
-
 <style>
-  /* unchanged from before */
   .app-shell {
     max-width: 440px;
     margin: 0 auto;
@@ -57,9 +74,9 @@
       border-radius: 32px;
       overflow: hidden;
       box-shadow:
-        0 0 0 1px rgba(0,0,0,.05),
-        0 30px 80px rgba(0,0,0,.09),
-        0 8px 24px rgba(0,0,0,.05);
+        0 0 0 1px rgba(0, 0, 0, .05),
+        0 30px 80px rgba(0, 0, 0, .09),
+        0 8px 24px rgba(0, 0, 0, .05);
     }
   }
 </style>
