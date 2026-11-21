@@ -1,286 +1,96 @@
 // src/lib/offline.js
-import { apiFetch } from './api.js';
+//
+// COMPATIBILITY SHIM — bridges the v1 API surface to the v2 core modules.
+//
+// HomePage.svelte and MovementPage.svelte still import from here. Once they
+// are rewritten on top of $lib/core/index.js, DELETE this file.
+//
+// Functions that used to be sync are now async under the hood. We keep the
+// sync signature where callers expect it, and provide async variants for
+// callers that can await.
 
-const CACHE_PREFIX = 'iebc:cache:';
-const QUEUE_KEY = 'iebc:queue:ops';
-const META_KEY = 'iebc:queue:meta';
+import { Cache, Queue } from './core/db.js';
+import {
+  enqueue as coreEnqueue,
+  pendingCount as corePendingCount,
+  getQueueSorted,
+  subscribeQueue,
+} from './core/queue.js';
+import { drainQueue as coreDrainQueue, subscribeSync } from './core/sync.js';
 
-// ═══════════════════════════════════════════════════════════
-// CACHE — last successful fetch per (ward, date) or (ward)
-// ═══════════════════════════════════════════════════════════
+// ── Cache ────────────────────────────────────────────────────
+// Old API: cacheGet(key) → value|null (sync)
+// Old API: cacheSet(key, value) (sync)
+// New API is async. We can't fake sync reads on IDB, so callers that
+// need the value should switch to `await cacheGetAsync(key)` (below).
+// For sync callers we return null and let them re-fetch from network —
+// that was already their fallback path.
+
+export async function cacheGetAsync(key) {
+  const row = await Cache.get(key);
+  return row ? row.value : null;
+}
+
+export function cacheGet(_key) {
+  // Deprecated sync read — returns null, triggering network fallback.
+  return null;
+}
 
 export function cacheSet(key, value) {
-  try {
-    localStorage.setItem(
-      CACHE_PREFIX + key,
-      JSON.stringify({ ts: Date.now(), value })
-    );
-  } catch (e) {
-    console.warn('[offline] cache write failed:', e);
-  }
+  Cache.set(key, value).catch((e) => console.warn('[offline] cacheSet failed:', e));
 }
 
-export function cacheGet(key) {
-  try {
-    const raw = localStorage.getItem(CACHE_PREFIX + key);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw);
-    return parsed.value;
-  } catch {
-    return null;
-  }
+export async function cacheAge(key) {
+  return Cache.age(key);
 }
 
-export function cacheAge(key) {
-  try {
-    const raw = localStorage.getItem(CACHE_PREFIX + key);
-    if (!raw) return null;
-    return Date.now() - JSON.parse(raw).ts;
-  } catch {
-    return null;
-  }
-}
+// ── Queue ────────────────────────────────────────────────────
 
-// ═══════════════════════════════════════════════════════════
-// QUEUE — pending operations awaiting sync
-// ═══════════════════════════════════════════════════════════
-
-function readQueue() {
-  try {
-    const raw = localStorage.getItem(QUEUE_KEY);
-    return raw ? JSON.parse(raw) : [];
-  } catch {
-    return [];
-  }
-}
-
-function writeQueue(ops) {
-  try {
-    localStorage.setItem(QUEUE_KEY, JSON.stringify(ops));
-  } catch (e) {
-    console.warn('[offline] queue write failed:', e);
-  }
-  notify();
-}
-
-function readMeta() {
-  try {
-    const raw = localStorage.getItem(META_KEY);
-    return raw ? JSON.parse(raw) : { lastSync: 0 };
-  } catch {
-    return { lastSync: 0 };
-  }
-}
-
-function writeMeta(meta) {
-  try {
-    localStorage.setItem(META_KEY, JSON.stringify(meta));
-  } catch { /* ignore */ }
-  notify();
-}
-
-/** Generate a short unique id. */
-function uid() {
-  return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-}
-
-/**
- * Add an operation to the queue.
- *
- * @param {string} kind   — 'entry.submit' | 'movement.save'
- * @param {object} payload — shape depends on kind, see `runOp` below
- * @returns {object} the queued op
- */
 export function enqueue(kind, payload) {
-  const op = {
-    id: uid(),
-    kind,
-    payload,
-    ts: Date.now(),
-    attempts: 0,
-    lastError: null,
-  };
-  const ops = readQueue();
-  ops.push(op);
-  writeQueue(ops);
-  return op;
+  // Async internally; old callers used it fire-and-forget.
+  return coreEnqueue(kind, payload).catch((e) =>
+    console.warn('[offline] enqueue failed:', e),
+  );
 }
 
-/** Get a snapshot of the current queue. */
-export function getQueue() {
-  return readQueue();
-}
-
-/** Remove an op by id. */
-export function dequeue(id) {
-  const ops = readQueue().filter((o) => o.id !== id);
-  writeQueue(ops);
-}
-
-/** Wipe the entire queue (use only for diagnostics). */
-export function clearQueue() {
-  writeQueue([]);
-  writeMeta({ lastSync: 0 });
-}
-
-/** Convenience: how many ops are pending. */
 export function pendingCount() {
-  return readQueue().length;
+  // Sync API expected but core is async. Return 0; UI refreshes via
+  // the subscribeQueue path in SyncBadge/SystemSheet which is already
+  // correct.
+  return 0;
 }
 
-// ═══════════════════════════════════════════════════════════
-// EXECUTORS — turn an op into a real HTTP request
-// ═══════════════════════════════════════════════════════════
-
-async function runOp(op) {
-  switch (op.kind) {
-    case 'entry.submit': {
-      const body = new URLSearchParams();
-      body.append('fingerprint', op.payload.fingerprint);
-      body.append('date', op.payload.date);
-      op.payload.entries.forEach((e) => {
-        body.append('kit_id[]', e.kit_id);
-        body.append('venue[]', e.venue);
-        body.append('registered_male[]', String(e.male || 0));
-        body.append('registered_female[]', String(e.female || 0));
-      });
-      return apiFetch('/kiems/submit-entries/', { method: 'POST', body });
-    }
-
-    case 'movement.save': {
-      return apiFetch('/movement/save/', {
-        method: 'POST',
-        json: {
-          ward_id: op.payload.ward_id,
-          fingerprint: op.payload.fingerprint,
-          schedule_date: op.payload.schedule_date,
-          entries: op.payload.entries,
-        },
-      });
-    }
-
-    default:
-      throw new Error(`Unknown op kind: ${op.kind}`);
-  }
+export function getQueue() {
+  return getQueueSorted();
 }
 
-// ═══════════════════════════════════════════════════════════
-// SYNC — drain the queue
-// ═══════════════════════════════════════════════════════════
-
-let syncing = false;
-
-/**
- * Attempt to send every queued op.
- * Returns { sent, failed, stillQueued }.
- */
-export async function drainQueue() {
-  if (syncing) return { sent: 0, failed: 0, stillQueued: pendingCount() };
-  if (!navigator.onLine) {
-    return { sent: 0, failed: 0, stillQueued: pendingCount() };
-  }
-  syncing = true;
-
-  const ops = readQueue();
-  const remaining = [];
-  let sent = 0;
-  let failed = 0;
-
-  for (const op of ops) {
-    try {
-      const res = await runOp(op);
-
-      // App-level success check: {ok: true} means done.
-      if (res && res.ok) {
-        sent++;
-        continue;
-      }
-
-      // App-level failure that isn't network-related → retry-able but
-      // don't spam. Bump attempts and keep in queue.
-      op.attempts += 1;
-      op.lastError = (res && res.error) || 'Server rejected';
-      if (op.attempts < 10) {
-        remaining.push(op);
-      } else {
-        // Give up but keep so the user can inspect
-        failed++;
-        remaining.push({ ...op, givenUp: true });
-      }
-    } catch (e) {
-      // Network error — keep in queue.
-      op.attempts += 1;
-      op.lastError = e.message || 'Network error';
-      remaining.push(op);
-    }
-  }
-
-  writeQueue(remaining);
-  if (sent > 0) {
-    writeMeta({ ...readMeta(), lastSync: Date.now() });
-  }
-  syncing = false;
-
-  return { sent, failed, stillQueued: remaining.length };
+export function dequeue(_id) {
+  // No-op shim; the queue engine drains on its own.
 }
 
-// ═══════════════════════════════════════════════════════════
-// REACTIVE NOTIFIER — subscribers get told when state changes
-// ═══════════════════════════════════════════════════════════
+export function clearQueue() {
+  Queue.mutate(() => []).catch(() => {});
+}
 
-const listeners = new Set();
+// ── Sync ─────────────────────────────────────────────────────
+
+export function drainQueue() {
+  return coreDrainQueue();
+}
 
 export function subscribeOffline(fn) {
-  listeners.add(fn);
-  fn(snapshot());
-  return () => listeners.delete(fn);
+  // Old shape was {online, pending, lastSync}
+  return subscribeSync((s) => fn({
+    online: s.online ?? true,
+    pending: s.pending ?? 0,
+    lastSync: s.lastSync ?? 0,
+  }));
 }
 
-function notify() {
-  const s = snapshot();
-  listeners.forEach((fn) => fn(s));
+export function initOffline() {
+  // Superseded by initSync() in App.svelte. No-op to keep old imports working.
 }
 
 export function snapshot() {
-  return {
-    online: typeof navigator !== 'undefined' ? navigator.onLine : true,
-    pending: pendingCount(),
-    lastSync: readMeta().lastSync,
-  };
-}
-
-// ═══════════════════════════════════════════════════════════
-// LIFECYCLE — auto-retry hooks (call once from App.svelte)
-// ═══════════════════════════════════════════════════════════
-
-let initialized = false;
-
-export function initOffline() {
-  if (initialized) return;
-  initialized = true;
-
-  window.addEventListener('online', () => {
-    notify();
-    drainQueue();
-  });
-
-  window.addEventListener('offline', () => {
-    notify();
-  });
-
-  document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible') {
-      drainQueue();
-    }
-  });
-
-  // Periodic background retry while queue non-empty
-  setInterval(() => {
-    if (pendingCount() > 0 && navigator.onLine) {
-      drainQueue();
-    }
-  }, 30_000);
-
-  // Best-effort drain at boot
-  drainQueue();
+  return { online: navigator.onLine, pending: 0, lastSync: 0 };
 }

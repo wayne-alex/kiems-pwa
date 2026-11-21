@@ -1,47 +1,15 @@
 // src/lib/session.js
 import { writable, get } from 'svelte/store';
+
 import { getDeviceFingerprint } from './device.js';
-import { apiFetch } from './api.js';
+import { Session as SessionDB, Meta } from './core/db.js';
+import { apiFetch } from './core/net.js';
 import { apiUrl } from './config.js';
 
 // ═══════════════════════════════════════════════════════════
-// CACHE — persisted session snapshot for offline boot
+// CONFIG
 // ═══════════════════════════════════════════════════════════
-const SESSION_CACHE_KEY = 'iebc:session';
 const STALENESS_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
-
-function loadCachedSession() {
-  try {
-    const raw = localStorage.getItem(SESSION_CACHE_KEY);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== 'object') return null;
-    if (!parsed.cachedAt || Date.now() - parsed.cachedAt > STALENESS_MS) {
-      return null;
-    }
-    return parsed;
-  } catch (err) {
-    console.warn('[session] cache read failed:', err);
-    return null;
-  }
-}
-
-function saveCachedSession(snapshot) {
-  try {
-    localStorage.setItem(
-      SESSION_CACHE_KEY,
-      JSON.stringify({ ...snapshot, cachedAt: Date.now() })
-    );
-  } catch (err) {
-    console.warn('[session] cache write failed:', err);
-  }
-}
-
-function clearCachedSession() {
-  try {
-    localStorage.removeItem(SESSION_CACHE_KEY);
-  } catch { /* ignore */ }
-}
 
 // ═══════════════════════════════════════════════════════════
 // STATE
@@ -71,28 +39,62 @@ export function sessionValue() {
 }
 
 // ═══════════════════════════════════════════════════════════
+// PERSISTENCE (IDB)
+// ═══════════════════════════════════════════════════════════
+async function loadCachedSession() {
+  try {
+    const row = await SessionDB.get();
+    if (!row || typeof row !== 'object') return null;
+    if (!row.cachedAt || Date.now() - row.cachedAt > STALENESS_MS) return null;
+    // A cached session is only usable if we still have a bound ward
+    if (!row.ward || !row.vra) return null;
+    return row;
+  } catch (err) {
+    console.warn('[session] cache read failed:', err);
+    return null;
+  }
+}
+
+async function saveCachedSession(snapshot) {
+  try {
+    await SessionDB.set({
+      fingerprint: snapshot.fingerprint,
+      deviceId: snapshot.deviceId,
+      vra: snapshot.vra,
+      ward: snapshot.ward,
+      constituency: snapshot.constituency,
+      cachedAt: Date.now(),
+    });
+  } catch (err) {
+    console.warn('[session] cache write failed:', err);
+  }
+}
+
+async function clearCachedSession() {
+  try {
+    await SessionDB.clear();
+  } catch { /* ignore */ }
+}
+
+// ═══════════════════════════════════════════════════════════
 // RESTORE — synchronous boot from cache (no network)
 // ═══════════════════════════════════════════════════════════
 /**
- * Try to bring the session up from localStorage without any network.
+ * Try to bring the session up from IDB without any network.
  * Returns true if a valid cached session was restored, false otherwise.
  *
- * Called from App.svelte's onMount BEFORE any network request.
+ * NOTE: this is async on purpose — IDB reads are async. Callers must
+ * `await restoreSession()`. App.svelte already awaits it before boot.
  */
-export function restoreSession() {
-  const cached = loadCachedSession();
+export async function restoreSession() {
+  const cached = await loadCachedSession();
   if (!cached) return false;
 
-  // Verify fingerprint matches — otherwise the cache is from another device
+  // Verify the fingerprint still matches — otherwise the cache was
+  // written by a different device/profile in this browser.
   const currentFp = localStorage.getItem('device_fingerprint');
   if (!currentFp || cached.fingerprint !== currentFp) {
-    clearCachedSession();
-    return false;
-  }
-
-  // Must actually be bound to be useful
-  if (!cached.ward || !cached.vra) {
-    clearCachedSession();
+    await clearCachedSession();
     return false;
   }
 
@@ -100,10 +102,10 @@ export function restoreSession() {
     ...s,
     status: 'bound',
     fingerprint: cached.fingerprint,
-    deviceId: cached.deviceId,
+    deviceId: cached.deviceId || null,
     vra: cached.vra,
     ward: cached.ward,
-    constituency: cached.constituency,
+    constituency: cached.constituency || null,
     error: null,
     lastRefresh: cached.cachedAt,
     fromCache: true,
@@ -117,14 +119,10 @@ export function restoreSession() {
 // RESOLVE — network-first, updates cache on success
 // ═══════════════════════════════════════════════════════════
 /**
- * Full resolution against the server. Call this:
- *   - on first-ever boot (no cache available)
- *   - in the background after a cached restore
- *   - after the BindModal succeeds
- *   - on an explicit retry from the UI
+ * Full resolution against the server.
  *
  * Pass { silent: true } to keep the current status while refreshing
- * (used for background refreshes so we don't flash the loading state).
+ * in the background (avoids flashing the loading skeleton).
  */
 export async function resolveSession({ silent = false } = {}) {
   if (!silent) {
@@ -136,7 +134,7 @@ export async function resolveSession({ silent = false } = {}) {
   try {
     const fingerprint = await getDeviceFingerprint();
 
-    // 1. Ensure device record exists (creates if needed)
+    // ── 1. Ensure device record exists (creates if needed) ──
     let reg = null;
     try {
       const res = await fetch(apiUrl('/kiems/register-device/'), {
@@ -161,7 +159,7 @@ export async function resolveSession({ silent = false } = {}) {
       console.warn('[session] register-device failed:', err);
     }
 
-    // 2. Resolve VRA binding
+    // ── 2. Resolve VRA binding ──
     const resolved = await apiFetch(
       `/kiems/resolve-vra/?fingerprint=${encodeURIComponent(fingerprint)}`
     );
@@ -183,7 +181,7 @@ export async function resolveSession({ silent = false } = {}) {
       };
 
       state.update((s) => ({ ...s, ...snapshot }));
-      saveCachedSession(snapshot);
+      await saveCachedSession(snapshot);
     } else {
       state.update((s) => ({
         ...s,
@@ -198,12 +196,12 @@ export async function resolveSession({ silent = false } = {}) {
         fromCache: false,
         refreshing: false,
       }));
-      clearCachedSession();
+      await clearCachedSession();
     }
   } catch (err) {
     console.error('[session] resolve failed:', err);
 
-    // If we already have a cached session, keep it and mark as stale
+    // If we already had a cached session, keep it and just note the error
     const current = get(state);
     if (current.status === 'bound' && current.fromCache) {
       state.update((s) => ({
@@ -257,16 +255,16 @@ export async function bindToWard({ wardId, constituencyId, fingerprint }) {
   };
 
   state.update((s) => ({ ...s, ...snapshot }));
-  saveCachedSession(snapshot);
+  await saveCachedSession(snapshot);
 
   return res;
 }
 
 // ═══════════════════════════════════════════════════════════
-// RESET — force a fresh resolve (e.g. after a failed bind)
+// RESET
 // ═══════════════════════════════════════════════════════════
-export function resetSession() {
-  clearCachedSession();
+export async function resetSession() {
+  await clearCachedSession();
   state.set({ ...initial });
 }
 
@@ -276,4 +274,16 @@ export function resetSession() {
 function cookie(name) {
   const m = document.cookie.split('; ').find((r) => r.startsWith(name + '='));
   return m ? decodeURIComponent(m.split('=').slice(1).join('=')) : null;
+}
+
+// ═══════════════════════════════════════════════════════════
+// Boot marker (used by App.svelte to know if it's first-run)
+// ═══════════════════════════════════════════════════════════
+export async function isFirstRun() {
+  const flag = await Meta.get('session_initialized', false);
+  return !flag;
+}
+
+export async function markInitialized() {
+  await Meta.set('session_initialized', true);
 }

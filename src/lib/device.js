@@ -4,7 +4,6 @@ let fpPromise = null;
 
 export async function getDeviceFingerprint() {
   if (fpPromise) return fpPromise;
-
   fpPromise = (async () => {
     try {
       const fp = await FingerprintJS.load();
@@ -21,7 +20,6 @@ export async function getDeviceFingerprint() {
       return fallback;
     }
   })();
-
   return fpPromise;
 }
 

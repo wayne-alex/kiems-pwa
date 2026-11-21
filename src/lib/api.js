@@ -8,11 +8,12 @@ function getCookie(name) {
   return decodeURIComponent(match.split('=').slice(1).join('='));
 }
 
-export async function apiFetch(url, { method = 'GET', body, json, headers = {} } = {}) {
+export async function apiFetch(url, { method = 'GET', body, json, headers = {}, idempotencyKey = null } = {}) {
   const finalHeaders = {
     'X-CSRFToken': getCookie('csrftoken') || '',
     ...headers,
   };
+  if (idempotencyKey) finalHeaders['Idempotency-Key'] = idempotencyKey;
 
   let payload;
   if (json !== undefined) {
@@ -30,9 +31,7 @@ export async function apiFetch(url, { method = 'GET', body, json, headers = {} }
   });
 
   let data = null;
-  try {
-    data = await res.json();
-  } catch {
+  try { data = await res.json(); } catch {
     throw new Error(`Server returned non-JSON (status ${res.status})`);
   }
   if (data === null) throw new Error(`Empty response (status ${res.status})`);
