@@ -182,30 +182,52 @@ export const OP_KINDS = {
     },
   },
 
-  'form_a.deallocate': {
-    priority: 5,
-    buildRequest(payload) {
-      return {
-        url: apiUrl('/api/form-a/deallocate/'),
-        init: {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            fingerprint: payload.fingerprint,
-            allocation_id: payload.allocation_id,
-            op_id: payload.op_id || '',
-          }),
-          credentials: 'include',
-        },
-      };
-    },
-    interpretResponse(data) {
-      if (data && data.ok) {
-        return { ok: true, deleted: true, kit_name: data.kit_name };
-      }
-      return { ok: false, error: (data && data.error) || 'Deallocation failed' };
-    },
+  
+'form_a.deallocate': {
+  priority: 5,
+
+  buildRequest(payload) {
+    return {
+      url: apiUrl('/api/form-a/deallocate/'),
+      init: {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          fingerprint: payload.fingerprint,
+
+          // Support both identification methods
+          allocation_id: payload.allocation_id || null,
+          receipt_id: payload.receipt_id || null,
+          kit_id: payload.kit_id || null,
+
+          // Partial relocation quantity
+          allocation_amount: payload.allocation_amount ?? null,
+
+          op_id: payload.op_id || '',
+        }),
+        credentials: 'include',
+      },
+    };
   },
+
+  interpretResponse(data) {
+    if (data && data.ok) {
+      return {
+        ok: true,
+        deleted: !!data.deleted,
+        kit_name: data.kit_name,
+        moved: data.moved,
+        remaining_allocated: data.remaining_allocated,
+      };
+    }
+
+    return {
+      ok: false,
+      error: (data && data.error) || 'Deallocation failed',
+    };
+  },
+},
+
 };
 
 // ── CSRF helper (works in SW too — reads cookie, doesn't touch DOM) ──
