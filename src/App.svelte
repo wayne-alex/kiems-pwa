@@ -24,7 +24,6 @@
   } from "./lib/core/ui.js";
 
   import BindModal from "./components/BindModal.svelte";
-  import UpdateBanner from "./components/UpdateBanner.svelte";
 
   import { session, restoreSession, resolveSession } from "./lib/session.js";
   import { migrateLegacyStorage } from "./lib/core/migrate.js";
@@ -173,8 +172,6 @@
 </script>
 
 <div class="app-shell">
-  <UpdateBanner />
-
   {#if !booted}
     <!-- First-frame skeleton: prevents a white flash while the SW + IDB
          migration settle. Kept minimal — the hero paint on Home will
