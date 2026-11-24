@@ -7,6 +7,7 @@
   import {
     enqueue,
     drainQueue,
+    retryOp,
     subscribeQueue,
     Cache,
     Queue,
@@ -21,6 +22,18 @@
   const dispatch = createEventDispatcher();
 
   const ZERO_MSG = "Enter at least one voter, or record 0 for today.";
+
+  // What the VRA sees on each kit
+  const STATUS = {
+    notsent: { label: "Not sent yet", cls: "pending" },
+    changed: { label: "Changes not sent", cls: "pending" },
+    sending: { label: "Sending…", cls: "sending" },
+    offline: { label: "Saved · waiting for signal", cls: "pending" },
+    sent: { label: "Sent", cls: "entered" },
+    failed: { label: "Couldn't send", cls: "failed" },
+  };
+  // These belong in the "Sent" group. Everything else is "Not sent yet".
+  const SENT_GROUP = new Set(["sent", "sending", "offline", "changed"]);
 
   // ── State ─────────────────────────────────────────────────
   let phase = "idle"; // idle | loading | unbound | error | ready
@@ -43,6 +56,16 @@
   let currentIndex = 0;
   let editingVenueFor = null;
 
+  // Sent kits the VRA chose to edit
+  let unlocked = new Set();
+  // Kits being sent right now (blocks double taps)
+  let savingIds = new Set();
+  // 'all' or a kit id: waiting for a 2nd tap to confirm a resend
+  let armed = null;
+  let armTimer;
+
+  let online = typeof navigator === "undefined" ? true : navigator.onLine;
+
   // venues planned in the Movement page: kit_id -> venue
   let planVenues = new Map();
 
@@ -54,7 +77,7 @@
   let suggestTimer;
   let blurTimer;
 
-  // queue (for "Queued" tags, waiting/failed notes, auto refresh)
+  // queue (for status tags, waiting/failed notes, auto refresh)
   let snap = { ops: [], online: true };
   let lastLive = 0;
   let refreshTimer;
@@ -88,6 +111,7 @@
     clearTimeout(refreshTimer);
     clearTimeout(suggestTimer);
     clearTimeout(blurTimer);
+    clearTimeout(armTimer);
   });
 
   // ── Date helpers ──────────────────────────────────────────
@@ -356,12 +380,46 @@
   $: liveOps = entryOps.filter(
     (o) => o.state !== "done" && o.state !== "gaveup",
   );
-  $: failedCount = entryOps.filter((o) => o.state === "gaveup").length;
+  $: failedOps = entryOps.filter((o) => o.state === "gaveup");
+  $: failedCount = failedOps.length;
   $: queuedKitIds = new Set(
     liveOps
       .filter((o) => o.payload?.date === selectedDate)
       .flatMap((o) => (o.payload?.entries || []).map((e) => String(e.kit_id))),
   );
+  $: failedByKit = groupFailed(failedOps, selectedDate);
+
+  function groupFailed(ops, day) {
+    const m = new Map();
+    for (const o of ops) {
+      if (o.payload?.date !== day) continue;
+      for (const e of o.payload?.entries || []) {
+        const k = String(e.kit_id);
+        m.set(k, [...(m.get(k) || []), o.id]);
+      }
+    }
+    return m;
+  }
+
+  // One honest status per kit
+  function statusOf(kit, queued, failed, isOnline) {
+    const id = String(kit.kit_id);
+    if (isDirty(kit)) return isRecorded(kit) ? "changed" : "notsent";
+    if (failed.has(id)) return "failed";
+    if (queued.has(id)) return isOnline ? "sending" : "offline";
+    return isRecorded(kit) ? "sent" : "notsent";
+  }
+
+  $: statusMap = new Map(
+    kits.map((k) => [
+      String(k.kit_id),
+      statusOf(k, queuedKitIds, failedByKit, online),
+    ]),
+  );
+  $: unsentCount = kits.filter(
+    (k) => !SENT_GROUP.has(statusMap.get(String(k.kit_id))),
+  ).length;
+  $: sentCount = kits.length - unsentCount;
 
   // Keep the saved kit list (read by Home) in step with what was just saved
   async function patchCache(list) {
@@ -537,6 +595,8 @@
     activeKitId = null;
     suggestions = [];
     planVenues = new Map();
+    unlocked = new Set();
+    disarm();
     kits = []; // never carry one day's edits into another day
     phase = "loading";
     await loadKits();
@@ -554,12 +614,13 @@
   $: totalFemale = kits.reduce((s, k) => s + (parseInt(k.female) || 0), 0);
   $: totalAll = totalMale + totalFemale;
   $: registeredCount = kits.filter(isRecorded).length;
-  $: pendingTotal = kits.length - registeredCount;
   $: entryProgress = kits.length
     ? Math.round((registeredCount / kits.length) * 100)
     : 0;
 
   $: dirtyKits = kits.filter(isDirty);
+  $: updateCount = dirtyKits.filter(isRecorded).length; // already sent, edited
+  $: newCount = dirtyKits.length - updateCount;
   $: canSubmit =
     dateRelation === "today" && dirtyKits.length > 0 && !submitting;
   $: showSubmit =
@@ -589,6 +650,42 @@
     if (on) node.focus();
   }
 
+  function unlockKit(kit) {
+    unlocked = new Set([...unlocked, String(kit.kit_id)]);
+    tick(6);
+  }
+
+  function relockKits(ids) {
+    const drop = new Set(ids.map(String));
+    unlocked = new Set([...unlocked].filter((id) => !drop.has(id)));
+  }
+
+  // Resending an entry that was already sent needs a second tap
+  function arm(key) {
+    armed = key;
+    clearTimeout(armTimer);
+    armTimer = setTimeout(() => (armed = null), 3000);
+    tick(6);
+  }
+  function disarm() {
+    armed = null;
+    clearTimeout(armTimer);
+  }
+
+  async function retryKit(kit) {
+    const ids = failedByKit.get(String(kit.kit_id)) || [];
+    for (const id of ids) {
+      try {
+        await retryOp(id);
+      } catch {
+        /* ignore */
+      }
+    }
+    drainQueue();
+    tick(8);
+    flash("Retrying…", 1200);
+  }
+
   // ── Validation ────────────────────────────────────────────
   function validateKit(kit, { allowZero = false } = {}) {
     const venue = (kit.venue || "").trim();
@@ -600,8 +697,12 @@
     return null;
   }
 
-  // ── Save one kit via the queue ────────────────────────────
+  // ── Send one kit via the queue ────────────────────────────
   async function saveKit(kit, opts = {}) {
+    const id = String(kit.kit_id);
+    if (savingIds.has(id)) return false; // already sending
+    if (!isDirty(kit) && isRecorded(kit)) return true; // nothing new: never resend
+
     const err = validateKit(kit, opts);
     if (err) {
       formError = err;
@@ -609,55 +710,89 @@
     }
     formError = null;
 
-    const entry = {
-      kit_id: kit.kit_id,
-      venue: kit.venue.trim(),
-      male: parseInt(kit.male) || 0,
-      female: parseInt(kit.female) || 0,
-    };
+    savingIds = new Set([...savingIds, id]);
+    try {
+      const entry = {
+        kit_id: kit.kit_id,
+        venue: kit.venue.trim(),
+        male: parseInt(kit.male) || 0,
+        female: parseInt(kit.female) || 0,
+      };
 
-    await enqueue("entry.submit", {
-      fingerprint: $session.fingerprint,
-      date: selectedDate,
-      entries: [entry],
-    });
-    drainQueue(); // send now instead of waiting for the 30s sweep
+      await enqueue("entry.submit", {
+        fingerprint: $session.fingerprint,
+        date: selectedDate,
+        entries: [entry],
+      });
+      drainQueue(); // send now instead of waiting for the 30s sweep
 
-    kit._orig_male = entry.male;
-    kit._orig_female = entry.female;
-    kit._orig_venue = entry.venue;
-    kit.has_registration = entry.male + entry.female > 0;
-    kit._saved = true;
-    kit._confirm_zero = false;
-    kits = kits;
-    patchCache(kits);
+      kit._orig_male = entry.male;
+      kit._orig_female = entry.female;
+      kit._orig_venue = entry.venue;
+      kit.has_registration = entry.male + entry.female > 0;
+      kit._saved = true;
+      kit._confirm_zero = false;
+      relockKits([id]);
+      kits = kits;
+      patchCache(kits);
 
-    tick([12, 40, 12]);
-    return true;
+      tick([12, 40, 12]);
+      return true;
+    } catch (e) {
+      formError = e?.message || "Could not send.";
+      return false;
+    } finally {
+      savingIds = new Set([...savingIds].filter((x) => x !== id));
+    }
   }
 
-  // Focus deck: "Save & next"
+  // List mode: the button on a kit card
+  async function sendKit(kit) {
+    const id = String(kit.kit_id);
+    if (savingIds.has(id) || submitting) return;
+    const isUpdate = isRecorded(kit);
+    if (isUpdate && armed !== id) {
+      arm(id); // 1st tap: ask to confirm
+      return;
+    }
+    disarm();
+    const ok = await saveKit(kit);
+    if (ok) {
+      flash(
+        isUpdate
+          ? "Updated · sending"
+          : navigator.onLine
+            ? "Sent"
+            : "Saved on this device",
+        1300,
+      );
+    } else if (formError) {
+      flash(formError, 2200);
+    }
+  }
+
+  // Focus deck: the main button
   async function handleAdvance(kit) {
     if (!isDirty(kit) && isRecorded(kit)) return true; // nothing new, just move on
     const ok = await saveKit(kit, { allowZero: true }); // the button label says "Record 0"
     if (!ok) {
-      flash(formError || "Could not save.", 2200);
+      flash(formError || "Could not send.", 2200);
       return false; // stay on this card
     }
-    flash(navigator.onLine ? "Saved · syncing" : "Saved on this device", 1200);
+    flash(navigator.onLine ? "Sent" : "Saved on this device", 1200);
     return true;
   }
 
   function handleFinal() {
     if (dirtyKits.length > 0) {
-      submitAll();
+      submitAll({ confirmed: true });
       return;
     }
     const pending = kits.filter((k) => !isRecorded(k));
     if (pending.length > 0) {
       currentIndex = kits.indexOf(pending[0]);
       flash(
-        `${pending.length} kit${pending.length === 1 ? "" : "s"} still pending`,
+        `${pending.length} kit${pending.length === 1 ? "" : "s"} still not sent`,
         2000,
       );
       return;
@@ -666,14 +801,17 @@
   }
 
   function saveLabelFor(k, atEnd) {
+    if (isRecorded(k)) {
+      if (!isDirty(k)) return atEnd ? "Finish" : "Next kit";
+      return atEnd ? "Update & finish" : "Update & next";
+    }
     const zero = !(parseInt(k.male) || 0) && !(parseInt(k.female) || 0);
-    if (zero && !isRecorded(k))
-      return atEnd ? "Record 0 & finish" : "Record 0 & next";
-    return atEnd ? "Save & finish" : "Save & next";
+    if (zero) return atEnd ? "Record 0 & finish" : "Record 0 & next";
+    return atEnd ? "Send & finish" : "Send & next";
   }
 
-  // ── Bulk submit (list mode) ───────────────────────────────
-  async function submitAll() {
+  // ── Bulk send (list mode) ─────────────────────────────────
+  async function submitAll({ confirmed = false } = {}) {
     formError = null;
 
     const toSubmit = dirtyKits.filter((k) => {
@@ -687,9 +825,16 @@
 
     if (formError) return;
     if (toSubmit.length === 0) {
-      formError = "No changes to submit.";
+      formError = "No changes to send.";
       return;
     }
+
+    // Updating entries that were already sent notifies ICT again: confirm first
+    if (toSubmit.some(isRecorded) && !confirmed && armed !== "all") {
+      arm("all");
+      return;
+    }
+    disarm();
 
     submitting = true;
 
@@ -707,7 +852,11 @@
     try {
       await enqueue("entry.submit", payload);
       drainQueue();
+
+      // Only the kits that were really sent become "saved"
+      const ids = new Set(toSubmit.map((k) => String(k.kit_id)));
       kits = kits.map((k) => {
+        if (!ids.has(String(k.kit_id))) return k;
         const m = parseInt(k.male) || 0;
         const f = parseInt(k.female) || 0;
         return {
@@ -720,18 +869,24 @@
           _confirm_zero: false,
         };
       });
+      relockKits([...ids]);
       patchCache(kits);
       tick([12, 40, 12]);
       flash(
-        `Saved ${toSubmit.length} ${toSubmit.length === 1 ? "entry" : "entries"} · ${navigator.onLine ? "syncing" : "will sync when online"}`,
+        `Sent ${toSubmit.length} ${toSubmit.length === 1 ? "entry" : "entries"}${navigator.onLine ? "" : " · will send when online"}`,
       );
     } catch (e) {
-      formError = e.message || "Could not submit.";
+      formError = e.message || "Could not send.";
     } finally {
       submitting = false;
     }
   }
 </script>
+
+<svelte:window
+  on:online={() => (online = true)}
+  on:offline={() => (online = false)}
+/>
 
 <PageTransition>
   <div class="ep">
@@ -866,7 +1021,7 @@
       <div class="sheet">
         {#if failedCount > 0}
           <div class="sync-note bad">
-            {failedCount} entr{failedCount === 1 ? "y" : "ies"} couldn't be sent. Tap the sync badge to retry.
+            {failedCount} entr{failedCount === 1 ? "y" : "ies"} couldn't be sent. Tap Retry on the kit, or the sync badge.
           </div>
         {:else if liveOps.length > 0}
           <div class="sync-note">
@@ -893,13 +1048,19 @@
                 <div class="fc">
                   <div class="fc-head">
                     <div class="fc-name">{current.kit_name}</div>
-                    {#if queuedKitIds.has(String(current.kit_id)) && !isDirty(current)}
-                      <span class="fc-chip queued">Queued</span>
-                    {:else if isRecorded(current) && !isDirty(current)}
-                      <span class="fc-chip done">Recorded</span>
-                    {:else if isDirty(current) && isRecorded(current)}
-                      <span class="fc-chip edit">Edited</span>
-                    {/if}
+                    {#each [statusMap.get(String(current.kit_id))] as st}
+                      {#if st === "sent"}
+                        <span class="fc-chip done">Sent</span>
+                      {:else if st === "sending"}
+                        <span class="fc-chip queued">Sending…</span>
+                      {:else if st === "offline"}
+                        <span class="fc-chip queued">Waiting for signal</span>
+                      {:else if st === "failed"}
+                        <span class="fc-chip failed">Couldn't send</span>
+                      {:else if st === "changed"}
+                        <span class="fc-chip edit">Changes not sent</span>
+                      {/if}
+                    {/each}
                     <div class="fc-serial">{current.serial_no}</div>
                   </div>
 
@@ -1027,40 +1188,58 @@
               <div class="empty">No kits assigned to this ward.</div>
             {:else if dateRelation === "today"}
               {#each ["pending", "entered"] as group (group)}
-                {#if (group === "pending" ? pendingTotal : registeredCount) > 0}
-                  <div class="section-head" class:spaced={group === "entered" && pendingTotal > 0}>
+                {#if (group === "pending" ? unsentCount : sentCount) > 0}
+                  <div class="section-head" class:spaced={group === "entered" && unsentCount > 0}>
                     <span class="section-title {group}">
                       <span class={group === "pending" ? "dot-warn" : "dot-ok"}></span>
-                      {group === "pending" ? "Pending" : "Registered"}
+                      {group === "pending" ? "Not sent yet" : "Sent"}
                     </span>
-                    <span class="section-count">{group === "pending" ? pendingTotal : registeredCount}</span>
+                    <span class="section-count">{group === "pending" ? unsentCount : sentCount}</span>
                   </div>
 
                   {#each kits as kit (kit.kit_id)}
-                    {#if isRecorded(kit) === (group === "entered")}
+                    {@const id = String(kit.kit_id)}
+                    {@const st = statusMap.get(id) || "notsent"}
+                    {#if SENT_GROUP.has(st) === (group === "entered")}
+                      {@const meta = STATUS[st] || STATUS.notsent}
+                      {@const locked = isRecorded(kit) && !isDirty(kit) && !unlocked.has(id)}
                       {@const err = validateKit(kit)}
-                      <div class="kit-card" class:entered={group === "entered"} class:dirty={isDirty(kit)}>
+                      {@const noChange = isRecorded(kit) && !isDirty(kit)}
+                      <div class="kit-card" class:entered={group === "entered"} class:dirty={isDirty(kit)} class:locked>
                         <div class="kit-head">
                           <div class="kit-left">
                             <span class="kit-name">{kit.kit_name}</span>
                             <span class="kit-serial">{kit.serial_no}</span>
                           </div>
-                          {#if queuedKitIds.has(String(kit.kit_id)) && !isDirty(kit)}
-                            <span class="kit-state pending">Queued</span>
-                          {:else if group === "pending"}
-                            <span class="kit-state pending"><span class="dot-pending"></span>Pending</span>
-                          {:else}
-                            <span class="kit-state entered">Entered</span>
-                          {/if}
+                          <span class="kit-state {meta.cls}">
+                            {#if st === "sending"}
+                              <span class="mini-spin"></span>
+                            {:else if st === "sent"}
+                              <svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor"
+                                   stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round">
+                                <path d="M5 12.5L10 17.5L19 7" />
+                              </svg>
+                            {:else}
+                              <span class="dot-pending"></span>
+                            {/if}
+                            {meta.label}
+                          </span>
                         </div>
 
-                        <label class="field">
+                        {#if !locked && isRecorded(kit)}
+                          <div class="kit-warn">
+                            This entry was already sent. Updating it notifies ICT again.
+                          </div>
+                        {/if}
+
+                        <label class="field" class:locked>
                           <input
                             type="text"
                             bind:value={kit.venue}
+                            readonly={locked}
                             on:input={(e) => onVenueType(kit, e.currentTarget.value)}
-                            on:focus={() => onVenueFocus(kit)}
-                            on:blur={() => onVenueBlur(kit)}
+                            on:focus={() => { if (!locked) onVenueFocus(kit); }}
+                            on:blur={() => { if (!locked) onVenueBlur(kit); }}
                             placeholder="Enter venue"
                             autocomplete="off"
                             autocapitalize="words"
@@ -1068,37 +1247,41 @@
                           />
                         </label>
 
-                        {#each [chipsFor(kit, activeKitId, suggestions, kits)] as chips}
-                          {#if chips.length}
-                            <div class="schips">
-                              {#each chips as c (c.key)}
-                                <button
-                                  type="button"
-                                  class="schip"
-                                  class:quick={c.quick}
-                                  on:pointerdown|preventDefault
-                                  on:click={() => applyChip(kit, c)}
-                                >
-                                  <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor"
-                                       stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
-                                    <path d="M5 12H19" /><path d="M13 6L19 12L13 18" />
-                                  </svg>
-                                  <span class="s-name">{c.venue}</span>
-                                  {#if c.tag}<span class="s-tag">{c.tag}</span>{/if}
-                                </button>
-                              {/each}
-                            </div>
-                          {/if}
-                        {/each}
+                        {#if !locked}
+                          {#each [chipsFor(kit, activeKitId, suggestions, kits)] as chips}
+                            {#if chips.length}
+                              <div class="schips">
+                                {#each chips as c (c.key)}
+                                  <button
+                                    type="button"
+                                    class="schip"
+                                    class:quick={c.quick}
+                                    on:pointerdown|preventDefault
+                                    on:click={() => applyChip(kit, c)}
+                                  >
+                                    <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor"
+                                         stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+                                      <path d="M5 12H19" /><path d="M13 6L19 12L13 18" />
+                                    </svg>
+                                    <span class="s-name">{c.venue}</span>
+                                    {#if c.tag}<span class="s-tag">{c.tag}</span>{/if}
+                                  </button>
+                                {/each}
+                              </div>
+                            {/if}
+                          {/each}
+                        {/if}
 
                         <div class="count-grid">
-                          <label class="count-input male">
+                          <label class="count-input male" class:locked>
                             <span class="count-label">Male</span>
-                            <input type="number" min="0" inputmode="numeric" bind:value={kit.male} placeholder="0" />
+                            <input type="number" min="0" inputmode="numeric" bind:value={kit.male}
+                                   readonly={locked} placeholder="0" />
                           </label>
-                          <label class="count-input female">
+                          <label class="count-input female" class:locked>
                             <span class="count-label">Female</span>
-                            <input type="number" min="0" inputmode="numeric" bind:value={kit.female} placeholder="0" />
+                            <input type="number" min="0" inputmode="numeric" bind:value={kit.female}
+                                   readonly={locked} placeholder="0" />
                           </label>
                         </div>
 
@@ -1106,16 +1289,36 @@
                           <span class="kit-total">
                             Total <b>{(parseInt(kit.male) || 0) + (parseInt(kit.female) || 0)}</b>
                           </span>
-                          <button
-                            class="save-btn"
-                            on:click={async () => {
-                              const ok = await saveKit(kit);
-                              if (ok) flash(navigator.onLine ? "Saved · syncing" : "Saved on this device", 1200);
-                            }}
-                            disabled={submitting || !!err}
-                          >
-                            Save
-                          </button>
+
+                          <div class="kit-actions">
+                            {#if locked}
+                              {#if st === "failed"}
+                                <button class="edit-btn" on:click={() => unlockKit(kit)}>Edit</button>
+                                <button class="save-btn danger" on:click={() => retryKit(kit)}>Retry</button>
+                              {:else if st === "sending"}
+                                <span class="sending-note"><span class="mini-spin"></span>Sending to ICT…</span>
+                              {:else}
+                                <button class="edit-btn" on:click={() => unlockKit(kit)}>Edit</button>
+                              {/if}
+                            {:else}
+                              <button
+                                class="save-btn"
+                                class:confirm={armed === id}
+                                on:click={() => sendKit(kit)}
+                                disabled={submitting || savingIds.has(id) || !!err || noChange}
+                              >
+                                {#if savingIds.has(id)}
+                                  Sending…
+                                {:else if noChange}
+                                  No changes
+                                {:else if isRecorded(kit)}
+                                  {armed === id ? "Tap again to resend" : "Update & resend"}
+                                {:else}
+                                  Send
+                                {/if}
+                              </button>
+                            {/if}
+                          </div>
                         </div>
                       </div>
                     {/if}
@@ -1157,14 +1360,29 @@
               {#if formError}
                 <div class="toast err" role="alert">{formError}</div>
               {/if}
-              <button class="cta" on:click={submitAll} disabled={!canSubmit}>
-                {#if submitting}Submitting…{:else}Submit entries{/if}
-              </button>
-              <div class="hint" class:ready={dirtyKits.length > 0}>
-                {#if dirtyKits.length > 0}
-                  {dirtyKits.length} kit{dirtyKits.length === 1 ? "" : "s"} ready to submit
+              <button
+                class="cta"
+                class:confirm={armed === "all"}
+                on:click={() => submitAll()}
+                disabled={!canSubmit}
+              >
+                {#if submitting}
+                  Sending…
+                {:else if armed === "all"}
+                  Tap again to resend
+                {:else if updateCount > 0}
+                  Send & update entries
                 {:else}
-                  Enter counts to enable submit
+                  Send entries
+                {/if}
+              </button>
+              <div class="hint" class:ready={dirtyKits.length > 0 && updateCount === 0} class:warn={updateCount > 0}>
+                {#if updateCount > 0}
+                  {updateCount} already sent · ICT will be notified again{#if newCount > 0} · {newCount} new{/if}
+                {:else if dirtyKits.length > 0}
+                  {dirtyKits.length} kit{dirtyKits.length === 1 ? "" : "s"} ready to send
+                {:else}
+                  Enter counts to enable sending
                 {/if}
               </div>
             </div>
@@ -2170,7 +2388,6 @@
     padding-top: 10px;
   }
 
-  /* Station suggestions + "Same as" chips */
   .schips {
     display: flex;
     flex-direction: column;
@@ -2250,6 +2467,84 @@
   .plan-link:active {
     background: #e1ecff;
   }
+    /* ── Sent / sending / failed states ───────────────────── */
+  .kit-state.sending { background: #e7f0ff; color: #1f55b8; }
+  .kit-state.failed { background: var(--red-soft); color: var(--red); }
+  .fc-chip.failed { background: var(--red-soft); color: var(--red); }
+
+  .mini-spin {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    border: 2px solid currentColor;
+    border-right-color: transparent;
+    border-radius: 50%;
+    animation: mini-spin 0.7s linear infinite;
+    flex-shrink: 0;
+  }
+  @keyframes mini-spin { to { transform: rotate(360deg); } }
+
+  /* Locked (already sent) cards */
+  .kit-card.locked { background: #fbfdfc; }
+  .field.locked { background: #f1f5f3; }
+  .field.locked:focus-within {
+    border-color: transparent;
+    background: #f1f5f3;
+    box-shadow: none;
+  }
+  .count-input.locked { opacity: 0.88; }
+  .count-input.locked:focus-within { border-color: transparent; }
+  .count-input.male.locked:focus-within { background: var(--male-tint); }
+  .count-input.female.locked:focus-within { background: var(--female-tint); }
+
+  .kit-warn {
+    margin: -2px 0 10px;
+    padding: 9px 12px;
+    border-radius: 12px;
+    background: var(--amber-soft);
+    color: var(--amber-ink);
+    font-size: 12px;
+    font-weight: 650;
+    line-height: 1.4;
+  }
+
+  .kit-actions { display: flex; align-items: center; gap: 8px; }
+  .edit-btn {
+    padding: 10px 16px;
+    border: 1.5px solid var(--line);
+    border-radius: 12px;
+    background: #fff;
+    color: var(--ink-2);
+    font: inherit;
+    font-size: 13px;
+    font-weight: 750;
+    cursor: pointer;
+  }
+  .edit-btn:active { background: var(--paper); }
+
+  .save-btn.confirm {
+    background: linear-gradient(135deg, #b36a00, #ef9400);
+    box-shadow: 0 8px 18px -8px rgba(239, 148, 0, 0.6);
+  }
+  .save-btn.danger {
+    background: linear-gradient(135deg, #e23b3b, #b0202f);
+    box-shadow: 0 8px 18px -8px rgba(226, 59, 59, 0.55);
+  }
+
+  .sending-note {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    font-size: 12.5px;
+    font-weight: 700;
+    color: #1f55b8;
+  }
+
+  .cta.confirm {
+    background: linear-gradient(135deg, #b36a00, #ef9400);
+    box-shadow: 0 12px 24px -12px rgba(239, 148, 0, 0.7);
+  }
+  .hint.warn { color: var(--amber-ink); font-weight: 700; }
 
   @media (prefers-reduced-motion: reduce) {
     .sk {
